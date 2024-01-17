@@ -1,0 +1,9 @@
+/build
+
+.DS_Store
+*/.DS_Store
+
+# JetBrains project files
+.idea
+
+cmake-build-debug
