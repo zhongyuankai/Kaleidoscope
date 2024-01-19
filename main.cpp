@@ -7,10 +7,28 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
-#include <iostream>
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include <algorithm>
+#include <cassert>
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
+#include <memory>
+#include <string>
+#include <vector>
 
 using namespace llvm;
 
@@ -435,6 +453,17 @@ static std::unique_ptr<Module> llvm_module;
 static std::unique_ptr<IRBuilder<>> llvm_builder;
 static std::map<std::string, Value *> named_values;
 
+//static std::unique_ptr<KaleidoscopeJIT> llvm_jit;
+static std::unique_ptr<FunctionPassManager> function_pass_manager;
+static std::unique_ptr<LoopAnalysisManager> loop_analysis_manager;
+static std::unique_ptr<FunctionAnalysisManager> function_analysis_manager;
+static std::unique_ptr<CGSCCAnalysisManager> cgscc_analysis_manager;
+static std::unique_ptr<ModuleAnalysisManager> module_analysis_manager;
+static std::unique_ptr<PassInstrumentationCallbacks> pass_instrumentation_callbacks;
+static std::unique_ptr<StandardInstrumentations> standard_instrumentations;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> function_protos;
+static ExitOnError exit_on_err;
+
 Value * LogErrorV(const char * str)
 {
     LogError(str);
@@ -547,6 +576,9 @@ Function * FunctionAST::codegen()
         /// variable the generated code, checking for consistency.
         verifyFunction(*function);
 
+        /// Optimize the function.
+        function_pass_manager->run(*function, *function_analysis_manager);
+
         return function;
     }
 
@@ -559,7 +591,7 @@ Function * FunctionAST::codegen()
 /// Top-Level parsing and JIT Driver
 ///===----------------------------------------------------------------------===//
 
-static void initializeModule()
+static void initializeModuleAndManagers()
 {
     /// Open a new context and module.
     llvm_context = std::make_unique<LLVMContext>();
@@ -567,6 +599,33 @@ static void initializeModule()
 
     /// Create a new builder for the module
     llvm_builder = std::make_unique<IRBuilder<>>(*llvm_context);
+
+    /// Create new pass and analysis managers.
+    function_pass_manager = std::make_unique<FunctionPassManager>();
+    loop_analysis_manager = std::make_unique<LoopAnalysisManager>();
+    function_analysis_manager = std::make_unique<FunctionAnalysisManager>();
+    cgscc_analysis_manager = std::make_unique<CGSCCAnalysisManager>();
+    module_analysis_manager = std::make_unique<ModuleAnalysisManager>();
+    pass_instrumentation_callbacks = std::make_unique<PassInstrumentationCallbacks>();
+    standard_instrumentations = std::make_unique<StandardInstrumentations>(*llvm_context, /*DebugLogging*/ true);
+
+    standard_instrumentations->registerCallbacks(*pass_instrumentation_callbacks, module_analysis_manager.get());
+
+    /// Add transform passes.
+    /// Do simple `peephole` optimizations and bit-twiddling optzns.
+    function_pass_manager->addPass(InstCombinePass());
+    /// Reassociate expressions.
+    function_pass_manager->addPass(ReassociatePass());
+    /// Eliminate Common SubExpressions
+    function_pass_manager->addPass(GVNPass());
+    /// Simplify the control flow graph (deleting unreachable blocks, etc).
+    function_pass_manager->addPass(SimplifyCFGPass());
+
+    /// Register analysis pass used in these transform passes.
+    PassBuilder pass_builder;
+    pass_builder.registerModuleAnalyses(*module_analysis_manager);
+    pass_builder.registerFunctionAnalyses(*function_analysis_manager);
+    pass_builder.crossRegisterProxies(*loop_analysis_manager, *function_analysis_manager, *cgscc_analysis_manager, *module_analysis_manager);
 }
 
 static void handleDefinition()
@@ -664,7 +723,7 @@ int main() {
     getNextToken();
 
     /// Make the module, which holds all the code.
-    initializeModule();
+    initializeModuleAndManagers();
 
     /// Run the main "interpreter loop" now.
     mainLoop();
