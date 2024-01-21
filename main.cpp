@@ -19,6 +19,7 @@
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Scalar/Reassociate.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "KaleidoscopeJIT.h"
 #include <algorithm>
 #include <cassert>
 #include <cctype>
@@ -31,6 +32,7 @@
 #include <vector>
 
 using namespace llvm;
+using namespace llvm::orc;
 
 ///===----------------------------------------------------------------------===//
 /// Lexer
@@ -453,7 +455,7 @@ static std::unique_ptr<Module> llvm_module;
 static std::unique_ptr<IRBuilder<>> llvm_builder;
 static std::map<std::string, Value *> named_values;
 
-//static std::unique_ptr<KaleidoscopeJIT> llvm_jit;
+static std::unique_ptr<KaleidoscopeJIT> kaleidoscope_jit;
 static std::unique_ptr<FunctionPassManager> function_pass_manager;
 static std::unique_ptr<LoopAnalysisManager> loop_analysis_manager;
 static std::unique_ptr<FunctionAnalysisManager> function_analysis_manager;
@@ -462,11 +464,26 @@ static std::unique_ptr<ModuleAnalysisManager> module_analysis_manager;
 static std::unique_ptr<PassInstrumentationCallbacks> pass_instrumentation_callbacks;
 static std::unique_ptr<StandardInstrumentations> standard_instrumentations;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> function_protos;
-static ExitOnError exit_on_err;
+static ExitOnError ExitOnErr;
 
 Value * LogErrorV(const char * str)
 {
     LogError(str);
+    return nullptr;
+}
+
+Function * getFunction(std::string name)
+{
+    /// First, see if the function has already been added to the current module.
+    if (auto * func = llvm_module->getFunction(name))
+        return func;
+
+    /// If not, check whether we can codegen the declaration form some existing prototype.
+    auto proto = function_protos.find(name);
+    if (proto != function_protos.end())
+        return proto->second->codegen();
+
+    /// If not existing prototype exists, return null.
     return nullptr;
 }
 
@@ -512,7 +529,7 @@ Value *BinaryExprAST::codegen()
 Value *CallExprAST::codegen()
 {
     /// Look up the name in the global module table
-    Function * callee_fun = llvm_module->getFunction(callee);
+    Function * callee_fun = getFunction(callee);
     if (!callee_fun)
         return LogErrorV("Unknown function referenced");
 
@@ -520,7 +537,7 @@ Value *CallExprAST::codegen()
         return LogErrorV("Incorrect # arguments passed");
 
     std::vector<Value *> argsv;
-    for (unsigned i = 0, e = argsv.size(); i != e; ++i)
+    for (unsigned i = 0, e = args.size(); i != e; ++i)
     {
         argsv.push_back(args[i]->codegen());
         if (!argsv.back())
@@ -548,11 +565,9 @@ Function * PrototypeAST::codegen()
 
 Function * FunctionAST::codegen()
 {
-    /// First, check for an existing function for a previous 'extern' declaration.
-    Function * function = llvm_module->getFunction(proto->getName());
-    if (!function)
-        function = proto->codegen();
-
+    auto & p = *proto;
+    function_protos[proto->getName()] = std::move(proto);
+    Function * function = getFunction(p.getName());
     if (!function)
         return nullptr;
 
@@ -595,7 +610,8 @@ static void initializeModuleAndManagers()
 {
     /// Open a new context and module.
     llvm_context = std::make_unique<LLVMContext>();
-    llvm_module = std::make_unique<Module>("my cool jit", *llvm_context);
+    llvm_module = std::make_unique<Module>("KaleidoscopeJIT", *llvm_context);
+    llvm_module->setDataLayout(kaleidoscope_jit->getDataLayout());
 
     /// Create a new builder for the module
     llvm_builder = std::make_unique<IRBuilder<>>(*llvm_context);
@@ -637,6 +653,9 @@ static void handleDefinition()
             fprintf(stderr, "Read function definition: \n");
             func_ir->print(errs());
             fprintf(stderr, "\n");
+            ExitOnErr(kaleidoscope_jit->addModule(
+                    ThreadSafeModule(std::move(llvm_module), std::move(llvm_context))));
+            initializeModuleAndManagers();
         }
     }
     else
@@ -655,6 +674,7 @@ static void handleExtern()
             fprintf(stderr, "Read extern: \n");
             func_ir->print(errs());
             fprintf(stderr, "\n");
+            function_protos[proto_ast->getName()] = std::move(proto_ast);
         }
     }
     else
@@ -674,6 +694,24 @@ static void handleTopLevelExpression()
             fprintf(stderr, "Read top-level expression: \n");
             expr_ir->print(errs());
             fprintf(stderr, "\n");
+
+            /// Create a ResourceTracker to track JIT`d memory allocated to our
+            /// anonymous expression -- that way we can free it after executing.
+            auto resource_tracker = kaleidoscope_jit->getMainJITDylib().createResourceTracker();
+
+            auto thread_safe_module = ThreadSafeModule(std::move(llvm_module), std::move(llvm_context));
+            ExitOnErr(kaleidoscope_jit->addModule(std::move(thread_safe_module), resource_tracker));
+            initializeModuleAndManagers();
+
+            /// Search the JIT for the __anon_expr symbol.
+            auto expr_symbol = ExitOnErr(kaleidoscope_jit->lookup("__anon_expr"));
+//            assert(expr_symbol && "Function not found");
+
+            /// Get the symbol`s address and cast it to the right type (takes no
+            /// arguments, return a double) so we can call it as a native function.
+            double (*func_ptr)() = expr_symbol.getAddress().toPtr<double (*)()>();
+            fprintf(stderr, "Evaluated to %f\n", func_ptr());
+            ExitOnErr(resource_tracker->remove());
         }
     }
     else
@@ -710,7 +748,39 @@ static void mainLoop()
 }
 
 
+///===----------------------------------------------------------------------===//
+/// "Library" functions that can be "extern'd" from user code.
+///===----------------------------------------------------------------------===//
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern "C" DLLEXPORT double putchard(double X) {
+    fputc((char)X, stderr);
+    return 0;
+}
+
+/// printd - printf that takes a double prints it as "%f\n", returning 0.
+extern "C" DLLEXPORT double printd(double X) {
+    fprintf(stderr, "%f\n", X);
+    return 0;
+}
+
+///===----------------------------------------------------------------------===//
+/// Main driver code.
+///===----------------------------------------------------------------------===//
+
+
+
 int main() {
+    InitializeNativeTarget();
+    InitializeNativeTargetAsmPrinter();
+    InitializeNativeTargetAsmParser();
+
     /// Install standard binary operators.
     /// 1 is lowest precedence.
     bin_op_precedence['<'] = 10;
@@ -721,6 +791,8 @@ int main() {
     /// Prime the first token.
     fprintf(stderr, "ready> ");
     getNextToken();
+
+    kaleidoscope_jit = ExitOnErr(KaleidoscopeJIT::Create());
 
     /// Make the module, which holds all the code.
     initializeModuleAndManagers();

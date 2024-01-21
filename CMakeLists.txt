@@ -6,7 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 find_package(LLVM REQUIRED CONFIG)
 
 #set(SOURCE_FILE LLVMIR.cpp)
-set(SOURCE_FILE main.cpp)
+set(SOURCE_FILE main.cpp
+        KaleidoscopeJIT.h)
 
 message(STATUS "This is BINARY dir " ${PROJECT_BINARY_DIR})
 message(STATUS "This is SOURCE dir " ${PROJECT_SOURCE_DIR})
